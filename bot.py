@@ -4,7 +4,7 @@ import os
 import threading
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from openai import OpenAI
@@ -51,12 +51,22 @@ def root():
     }
 
 
+@web_app.head("/")
+def root_head():
+    return Response(status_code=200)
+
+
 @web_app.get("/health")
 def health():
     return {
         "ok": True,
         "log_url": LOG_URL
     }
+
+
+@web_app.head("/health")
+def health_head():
+    return Response(status_code=200)
 
 
 @web_app.get("/run.jsonl")
@@ -118,10 +128,14 @@ async def handle_message(
     })
 
     history = conversation_history.setdefault(chat_id, [])
+
     history.append({
         "role": "user",
         "content": user_text
     })
+
+    # Keep only the latest messages so history does not grow forever.
+    del history[:-20]
 
     system_prompt = (
         "You are a careful data analyst. "
@@ -145,7 +159,12 @@ async def handle_message(
             ] + history[-6:]
         )
 
-        reply_text = response.choices[0].message.content.strip()
+        reply_text = (
+            response.choices[0]
+            .message
+            .content
+            .strip()
+        )
 
         history.append({
             "role": "assistant",
@@ -173,6 +192,7 @@ async def handle_message(
                 "answer": parsed
             }
 
+        # Always replace the model's log URL with the real one.
         parsed["log_url"] = LOG_URL
 
         final_reply = json.dumps(
@@ -220,6 +240,12 @@ telegram_app.add_handler(
 
 
 if __name__ == "__main__":
+    # This also ensures run.jsonl is not empty after deployment.
+    log_event({
+        "type": "startup",
+        "log_url": LOG_URL
+    })
+
     web_thread = threading.Thread(
         target=run_web_server,
         daemon=True
@@ -227,9 +253,11 @@ if __name__ == "__main__":
 
     web_thread.start()
 
+    port = int(os.environ.get("PORT", "8000"))
+
     print("Bot and web server are running...")
-    print("Health: http://localhost:8000/health")
-    print("Log: http://localhost:8000/run.jsonl")
+    print(f"Web server port: {port}")
+    print(f"Public log URL: {LOG_URL}")
     print("Press Ctrl+C to stop.")
 
     telegram_app.run_polling()
