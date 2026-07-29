@@ -1,4 +1,4 @@
 .env
 __pycache__/
-*.pycrun.jsonl
+*.pyc
 run.jsonl

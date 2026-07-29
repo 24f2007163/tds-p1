@@ -1,70 +1,235 @@
 import json
 import time
 import os
+import threading
+
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, PlainTextResponse
+
 from openai import OpenAI
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 from dotenv import load_dotenv
 
 
+# --------------------------------------------------
+# Environment variables
+# --------------------------------------------------
+
 load_dotenv()
+
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 AIPIPE_TOKEN = os.environ["AIPIPE_TOKEN"]
 LOG_URL = os.environ["LOG_URL"]
 
-client = OpenAI(base_url="https://aipipe.org/openai/v1", api_key=AIPIPE_TOKEN)
+client = OpenAI(
+    base_url="https://aipipe.org/openai/v1",
+    api_key=AIPIPE_TOKEN
+)
+
 LOG_FILE = "run.jsonl"
 
-# Keeps the last few messages per chat, so multi-turn questions work —
-# "answer the LAST message" still needs the earlier ones for context.
+
+# --------------------------------------------------
+# Public web server
+# --------------------------------------------------
+
+web_app = FastAPI()
+
+
+@web_app.get("/")
+def root():
+    return {
+        "service": "data-analyst-telegram-bot",
+        "log_url": LOG_URL
+    }
+
+
+@web_app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "log_url": LOG_URL
+    }
+
+
+@web_app.get("/run.jsonl")
+def get_run_log():
+    if os.path.exists(LOG_FILE):
+        return FileResponse(
+            path=LOG_FILE,
+            media_type="application/x-ndjson",
+            filename="run.jsonl"
+        )
+
+    return PlainTextResponse(
+        "",
+        media_type="application/x-ndjson"
+    )
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", "8000"))
+
+    uvicorn.run(
+        web_app,
+        host="0.0.0.0",
+        port=port
+    )
+
+
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
+
 conversation_history = {}
+
 
 def log_event(event: dict):
     event["timestamp"] = time.time()
-    with open(LOG_FILE, "a") as f:
-        f.write(json.dumps(event) + "\n")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with open(LOG_FILE, "a", encoding="utf-8") as file:
+        file.write(
+            json.dumps(event, ensure_ascii=False) + "\n"
+        )
+
+
+# --------------------------------------------------
+# Telegram message handler
+# --------------------------------------------------
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     chat_id = update.effective_chat.id
     user_text = update.message.text
-    log_event({"type": "incoming", "chat_id": chat_id, "text": user_text})
+
+    log_event({
+        "type": "incoming",
+        "chat_id": chat_id,
+        "text": user_text
+    })
 
     history = conversation_history.setdefault(chat_id, [])
-    history.append({"role": "user", "content": user_text})
+    history.append({
+        "role": "user",
+        "content": user_text
+    })
 
-    # Ask the AI to work out the answer. The system prompt tells it exactly how to
-    # format the final reply — this is the part that MUST match what the question asked.
     system_prompt = (
-        "You are a careful data analyst. The user's LAST message asks a data-analysis "
-        "question and tells you exactly what JSON shape to reply with. Work out the "
-        "real answer (use any public data you know, e.g. MOSPI statistics, general "
-        "world knowledge, or arithmetic on numbers given in the message). "
-        "Reply with ONLY that exact JSON object and absolutely nothing else — no "
-        "explanation, no markdown, no code fences, just the raw JSON."
+        "You are a careful data analyst. "
+        "The user's LAST message asks a data-analysis question and tells you "
+        "exactly what JSON shape to reply with. Earlier messages are context. "
+        "Work out the real answer using the data in the conversation, public "
+        "statistics you reliably know, or arithmetic on the supplied values. "
+        "Reply with ONLY the exact JSON object requested by the user. "
+        "Do not include explanations, markdown, or code fences. "
+        "Do not add extra keys inside answer."
     )
-    response = client.chat.completions.create(
-        model="gpt-5-mini",
-        messages=[{"role": "system", "content": system_prompt}] + history[-6:],
-    )
-    reply_text = response.choices[0].message.content.strip()
-    history.append({"role": "assistant", "content": reply_text})
 
-    # Make sure we actually reply with valid JSON containing "log_url" — if the model
-    # forgot the log_url field or wrapped it in markdown, fix it up here so the grader
-    # never sees a malformed reply.
     try:
-        parsed = json.loads(reply_text)
-    except json.JSONDecodeError:
-        # Model added extra text — try to pull out just the {...} part.
-        start, end = reply_text.find("{"), reply_text.rfind("}")
-        parsed = json.loads(reply_text[start:end + 1])
-    parsed["log_url"] = LOG_URL
-    final_reply = json.dumps(parsed)
+        response = client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt
+                }
+            ] + history[-6:]
+        )
 
-    log_event({"type": "outgoing", "chat_id": chat_id, "text": final_reply})
+        reply_text = response.choices[0].message.content.strip()
+
+        history.append({
+            "role": "assistant",
+            "content": reply_text
+        })
+
+        try:
+            parsed = json.loads(reply_text)
+
+        except json.JSONDecodeError:
+            start = reply_text.find("{")
+            end = reply_text.rfind("}")
+
+            if start == -1 or end == -1:
+                raise ValueError(
+                    "The model did not return a JSON object."
+                )
+
+            parsed = json.loads(
+                reply_text[start:end + 1]
+            )
+
+        if not isinstance(parsed, dict):
+            parsed = {
+                "answer": parsed
+            }
+
+        parsed["log_url"] = LOG_URL
+
+        final_reply = json.dumps(
+            parsed,
+            ensure_ascii=False
+        )
+
+    except Exception as error:
+        log_event({
+            "type": "error",
+            "chat_id": chat_id,
+            "error": str(error)
+        })
+
+        final_reply = json.dumps({
+            "answer": "internal error",
+            "log_url": LOG_URL
+        })
+
+    log_event({
+        "type": "outgoing",
+        "chat_id": chat_id,
+        "text": final_reply
+    })
+
     await update.message.reply_text(final_reply)
 
-app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-print("Bot is running... (Ctrl+C to stop)")
-app.run_polling()
+
+# --------------------------------------------------
+# Start Telegram bot and web server
+# --------------------------------------------------
+
+telegram_app = (
+    ApplicationBuilder()
+    .token(TELEGRAM_BOT_TOKEN)
+    .build()
+)
+
+telegram_app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_message
+    )
+)
+
+
+if __name__ == "__main__":
+    web_thread = threading.Thread(
+        target=run_web_server,
+        daemon=True
+    )
+
+    web_thread.start()
+
+    print("Bot and web server are running...")
+    print("Health: http://localhost:8000/health")
+    print("Log: http://localhost:8000/run.jsonl")
+    print("Press Ctrl+C to stop.")
+
+    telegram_app.run_polling()
