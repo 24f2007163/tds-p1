@@ -240,6 +240,7 @@ telegram_app.add_handler(
 
 
 if __name__ == "__main__":
+    
     # This also ensures run.jsonl is not empty after deployment.
     log_event({
         "type": "startup",
