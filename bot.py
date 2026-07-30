@@ -25,12 +25,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-AIPIPE_TOKEN = os.environ["AIPIPE_TOKEN"]
+LLM_API_KEY = os.environ["LLM_API_KEY"]
+LLM_BASE_URL = os.environ.get(
+    "LLM_BASE_URL",
+    "https://api.groq.com/openai/v1"
+)
+LLM_MODEL = os.environ.get(
+    "LLM_MODEL",
+    "openai/gpt-oss-120b"
+)
 LOG_URL = os.environ["LOG_URL"]
 
 client = OpenAI(
-    base_url="https://aipipe.org/openai/v1",
-    api_key=AIPIPE_TOKEN
+    base_url=LLM_BASE_URL,
+    api_key=LLM_API_KEY
 )
 
 LOG_FILE = "run.jsonl"
@@ -150,7 +158,7 @@ async def handle_message(
 
     try:
         response = client.chat.completions.create(
-            model="gpt-5-mini",
+            model=LLM_MODEL,
             messages=[
                 {
                     "role": "system",
